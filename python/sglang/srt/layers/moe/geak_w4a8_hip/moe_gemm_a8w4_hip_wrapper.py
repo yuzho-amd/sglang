@@ -41,6 +41,8 @@ def moe_gemm_a8w4_hip(
     scatter_indx: Optional[torch.Tensor] = None,
     gammas: Optional[torch.Tensor] = None,
     swizzle_mx_scale: Optional[str] = None,
+    weight_is_shuffled: bool = False,
+    gate_up_shuffled: bool = True,
 ):
     """W4A8 MoE GEMM (HIP).
 
@@ -49,10 +51,22 @@ def moe_gemm_a8w4_hip(
       - FP8 e4m3 activation + per-tensor static scale
       - MXFP4 e2m1 weight + per-1x32 e8m0 scale
       - optional gather_indx / scatter_indx / gammas / swizzle_mx_scale
+
+    Optional shuffled-weight fast path (opt6):
+      - weight_is_shuffled=True asks the kernel to read W (+ w_scales) using
+        aiter's `shuffle_weight_a16w4` / `shuffle_scale_a16w4` byte layout.
+        Coalesces wave loads (~16x fewer cache-line transactions).
+      - gate_up_shuffled selects between the two shuffle variants in
+        aiter.ops.shuffle (gate_up=True is the stage-1 W13 layout that
+        interleaves gate+up rows; False is the plain W2 layout).
+      - Shape of `w` / `w_scales` is unchanged (shuffle is in-place byte
+        permutation). The kernel knows it must reverse the permutation
+        when reading.
     """
     assert x.dtype == torch.float8_e4m3fn
     assert w.dtype == torch.uint8 and w_scales.dtype == torch.uint8
-    assert w.stride(-2) == 1, "w must be K-fast (stride(-2)==1)"
+    if not weight_is_shuffled:
+        assert w.stride(-2) == 1, "w must be K-fast (stride(-2)==1) on the unshuffled path"
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
     K = x.shape[-1]
     N = w.shape[-1]
@@ -85,6 +99,14 @@ def moe_gemm_a8w4_hip(
 
     swizzle_flag = 1 if swizzle_mx_scale == "CDNA4_SCALE" else 0
     n_expts_act = int(routing_data.n_expts_act)
+    # weight_layout_flag: 0=unshuffled (default, K-fast), 1=aiter shuffle
+    # gate_up=True (W13), 2=aiter shuffle gate_up=False (W2).
+    if not weight_is_shuffled:
+        weight_layout_flag = 0
+    elif gate_up_shuffled:
+        weight_layout_flag = 1
+    else:
+        weight_layout_flag = 2
 
     ext = get_extension()
     ext.launch_moe_gemm_a8w4(
@@ -100,6 +122,7 @@ def moe_gemm_a8w4_hip(
         int(grid_m), int(grid_n),
         int(block_m), int(block_n), int(block_k),
         int(swizzle_flag),
+        int(weight_layout_flag),
     )
     if scatter_indx is not None and y_final is not None:
         # Mirror aiter's moe_gemm_a8w4: post-kernel grouped reduction.
