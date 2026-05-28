@@ -1030,6 +1030,16 @@ extern "C" void launch_moe_gemm_a8w4(
         else if (block_n == 256) LAUNCH(64, 256);
         else if (block_n == 512) LAUNCH(64, 512);
         else TORCH_CHECK(false, "unsupported block_n for block_m=64: ", block_n);
+    } else if (block_m == 128) {
+        // BLOCK_M == 128 reuses the 16x16x128 MFMA path (WAVES_M = 8,
+        // TPB = 512). Same set of BLOCK_N as block_m=64.
+        if      (block_n == 16)  LAUNCH(128, 16);
+        else if (block_n == 32)  LAUNCH(128, 32);
+        else if (block_n == 64)  LAUNCH(128, 64);
+        else if (block_n == 128) LAUNCH(128, 128);
+        else if (block_n == 256) LAUNCH(128, 256);
+        else if (block_n == 512) LAUNCH(128, 512);
+        else TORCH_CHECK(false, "unsupported block_n for block_m=128: ", block_n);
     } else {
         TORCH_CHECK(false, "unsupported block_m: ", block_m);
     }
