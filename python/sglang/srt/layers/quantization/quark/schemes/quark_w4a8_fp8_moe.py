@@ -32,6 +32,7 @@ __all__ = ["QuarkW4A8Fp8MoE"]
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_geak_hip = get_bool_env_var("SGLANG_W4A8_HIP_GEAK") and _is_hip
 _is_gfx950 = is_gfx95_supported()
 
 OCP_MX_BLOCK_SIZE = 32
@@ -272,6 +273,37 @@ class QuarkW4A8Fp8MoE(QuarkMoEScheme):
             StandardCombineInput,
         )
 
+        # SGLANG_W4A8_HIP_GEAK gate: swap aiter's triton moe_gemm_a8w4 for our
+        # optimized HIP MoE GEMM (gfx950-only). The HIP kernel matches aiter's
+        # call surface for the QuarkW4A8 subset: gather_indx / scatter_indx /
+        # gammas / swizzle_mx_scale="CDNA4_SCALE". Pre-/post-quant + SwiGLU
+        # are unchanged (still aiter's triton kernels).
+        if _use_geak_hip:
+            from sglang.srt.layers.moe.geak_w4a8_hip.moe_gemm_a8w4_hip_wrapper import (
+                moe_gemm_a8w4_hip,
+            )
+
+            def _gemm(
+                x, w, x_scales, w_scales, x_static_scale, quant_static_scale,
+                bias, rdata, gather_indx, scatter_indx, gammas,
+                swizzle_mx_scale, out_dtype, apply_swiglu, add_residual=False,
+            ):
+                # The geak HIP kernel doesn't fuse output quant, bias, or
+                # SwiGLU; QuarkW4A8Fp8MoE doesn't ask for those either
+                # (quant_static_scale/bias/apply_swiglu are always None/False
+                # in this method's two call sites). Assert to catch drift.
+                assert x_scales is None and quant_static_scale is None
+                assert bias is None and not apply_swiglu
+                return moe_gemm_a8w4_hip(
+                    x, w, w_scales, x_static_scale, rdata,
+                    out_dtype=out_dtype,
+                    gather_indx=gather_indx, scatter_indx=scatter_indx,
+                    gammas=gammas, swizzle_mx_scale=swizzle_mx_scale,
+                )
+        else:
+            def _gemm(*args, **kwargs):
+                return moe_gemm_a8w4(*args, **kwargs)
+
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
@@ -303,7 +335,7 @@ class QuarkW4A8Fp8MoE(QuarkMoEScheme):
         # The kernel writes one row per (token, selected_expert) pair via
         # gather_idx; output preserves the [gate; up] stacked layout from the
         # weight, ready for silu_and_mul below.
-        stage1_out = moe_gemm_a8w4(
+        stage1_out = _gemm(
             h_fp8,
             layer.w13_weight,
             None,  # x_scales (no per-token MX scale, we are static FP8)
@@ -335,7 +367,7 @@ class QuarkW4A8Fp8MoE(QuarkMoEScheme):
         # ------------------------------------------------------------------
         # gammas = per-(token,expert) gate weight, applied during the scatter
         # reduction so we end up with one bf16 row per original token.
-        out = moe_gemm_a8w4(
+        out = _gemm(
             inter_fp8,
             layer.w2_weight,
             None,

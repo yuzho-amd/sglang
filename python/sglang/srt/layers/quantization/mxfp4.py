@@ -140,6 +140,10 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+# Opt-in HIP W4A8 MoE GEMM (GEAK). Reuses _use_aiter's preconditions
+# (HIP, MXFP4 weight format). Falls through to the aiter path when the
+# shape isn't supported (e.g. small block_m).
+_use_geak_hip = get_bool_env_var("SGLANG_W4A8_HIP_GEAK") and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _sm120_mxfp4_min_warps_patched = False
 
@@ -766,7 +770,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             return
-        if _use_aiter:
+        if _use_aiter and not _use_geak_hip:
+            # Skip aiter's MoE-GEMM-specific weight shuffle when SGLANG_W4A8_HIP_GEAK
+            # is also active. The geak HIP MoE GEMM kernel is selected by apply()
+            # (its branch precedes the _use_aiter branch) and consumes the original
+            # unshuffled (E, 2*inter, K/2) MXFP4 layout. aiter's non-MoE
+            # optimizations (attention / RMSNorm / RoPE / etc.) do not touch these
+            # MoE weight tensors, so skipping the shuffle here costs nothing for
+            # them — it only avoids feeding shuffled weights into geak.
             if layer.w13_weight_bias is not None:
                 layer.w13_weight_bias.data = layer.w13_weight_bias.data.to(
                     torch.float32
@@ -1193,6 +1204,47 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 output=symm_output,
             )[0]
             return StandardCombineInput(hidden_states=trtllm_gen_output)
+
+        if _use_geak_hip:
+            # Optimized HIP W4A8 MoE GEMM (GEAK). Replaces the two MoE
+            # GEMM stages with an in-house HIP kernel; reuses aiter/torch
+            # helpers for the surrounding quant / SwiGLU / reduce steps.
+            #
+            # NOTE: this branch is only enabled when the env var is set.
+            # When env var is unset, behavior is byte-for-byte unchanged.
+            from sglang.srt.layers.moe.geak_w4a8_hip.geak_fused_moe import (
+                geak_fused_moe,
+            )
+            from sglang.srt.layers.moe.token_dispatcher import (
+                StandardCombineInput,
+            )
+
+            topk_weights, topk_ids, _ = topk_output
+            topk_weights = topk_weights.to(torch.float32)
+            x_padded = torch.nn.functional.pad(
+                x, (0, self.hidden_pad), mode="constant", value=0.0
+            )
+            geak_out = geak_fused_moe(
+                hidden_states=x_padded,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weight=topk_weights,
+                topk_ids=topk_ids.to(torch.int32),
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=None, a2_scale=None,
+                bias1=layer.w13_weight_bias,
+                bias2=layer.w2_weight_bias,
+                activation=self.moe_runner_config.activation,
+                expert_mask=None,
+                doweight_stage1=(
+                    self.moe_runner_config.apply_router_weight_on_input
+                ),
+                hidden_pad=0,
+                intermediate_pad=0,
+            )
+            return StandardCombineInput(hidden_states=geak_out)
+
         if _use_aiter:
             from sglang.srt.layers.moe.moe_runner.aiter import (
                 AiterMoeQuantInfo,
