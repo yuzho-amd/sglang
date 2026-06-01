@@ -196,6 +196,11 @@ class QuarkW4A8Fp8MoE(QuarkMoEScheme):
             a2 = a2 * 2.0
         layer.w13_input_scale = torch.nn.Parameter(a13, requires_grad=False)
         layer.w2_input_scale = torch.nn.Parameter(a2, requires_grad=False)
+        # Cache host-side scalars so the HIP MoE GEMM wrapper doesn't need a
+        # D->H sync (.item()) inside the forward path — that sync is illegal
+        # during CUDA/HIP graph capture (hipErrorStreamCaptureUnsupported).
+        layer.w13_input_scale_value = float(a13.item())
+        layer.w2_input_scale_value = float(a2.item())
 
         # Reorder weights into moe_gemm_a8w4's expected layout:
         #   weight: [E, K/2, N]   - kernel requires ``w.stride(-2) == 1``
@@ -342,7 +347,7 @@ class QuarkW4A8Fp8MoE(QuarkMoEScheme):
             layer.w13_weight,
             None,  # x_scales (no per-token MX scale, we are static FP8)
             layer.w13_weight_scale,
-            layer.w13_input_scale,  # x_static_scale (per-tensor)
+            layer.w13_input_scale_value if _use_geak_hip else layer.w13_input_scale,  # x_static_scale (per-tensor)
             None,  # quant_static_scale: no fused output requant
             None,  # bias (Qwen3.5 MoE has no expert bias)
             routing_data,
@@ -374,7 +379,7 @@ class QuarkW4A8Fp8MoE(QuarkMoEScheme):
             layer.w2_weight,
             None,
             layer.w2_weight_scale,
-            layer.w2_input_scale,
+            layer.w2_input_scale_value if _use_geak_hip else layer.w2_input_scale,
             None,
             None,
             routing_data,

@@ -25,7 +25,7 @@ rule cuda_compile
 rule link
   command = $cxx $in $ldflags -o $out
 
-build moe_op_gemm_a8w4_hip_hip.cuda.o: cuda_compile /mnt/data/yuzho/hyperloom/sglang/python/sglang/srt/layers/moe/geak_w4a8_hip/moe_op_gemm_a8w4_hip_hip.hip
+build moe_op_gemm_a8w4_hip_hip.cuda.o: cuda_compile /home/yuzho/0415_mp/sglang/python/sglang/srt/layers/moe/geak_w4a8_hip/moe_op_gemm_a8w4_hip_hip.hip
 
 
 
