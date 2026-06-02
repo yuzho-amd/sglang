@@ -29,6 +29,28 @@ from aiter.ops.triton.moe.reduce import reduce_grouped
 from .kernel_loader import get_extension
 
 
+# Per-device cached empty placeholder tensors. The launch_moe_gemm_a8w4 ABI
+# wants a real tensor for "feature off" slots (gather_indx, scatter_indx,
+# gammas, expt_offs_sum) so we used to allocate `torch.empty((0,), ...)`
+# per call. Allocating 4x per-call (one per layer = 320 allocs / token at 40
+# layers, 2 GEMMs each) shows up at ~3us each in profilers. Hoist them.
+_EMPTY_I32_CACHE: dict[tuple[str, int], torch.Tensor] = {}
+_EMPTY_F32_CACHE: dict[tuple[str, int], torch.Tensor] = {}
+
+
+def _empty_placeholders(device: torch.device):
+    key = (device.type, -1 if device.index is None else device.index)
+    i32 = _EMPTY_I32_CACHE.get(key)
+    if i32 is None:
+        i32 = torch.empty((0,), dtype=torch.int32, device=device)
+        _EMPTY_I32_CACHE[key] = i32
+    f32 = _EMPTY_F32_CACHE.get(key)
+    if f32 is None:
+        f32 = torch.empty((0,), dtype=torch.float32, device=device)
+        _EMPTY_F32_CACHE[key] = f32
+    return i32, f32
+
+
 def moe_gemm_a8w4_hip(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -79,19 +101,29 @@ def moe_gemm_a8w4_hip(
     y = y.squeeze(0).contiguous()
 
     expt_data = routing_data.expt_data
-    expt_hist = expt_data.hist.to(torch.int32).contiguous()
-    expt_offs = expt_data.token_offs_raw.to(torch.int32).contiguous()
-    expt_block_pid_map = expt_data.block_pid_map.to(torch.int32).contiguous()
+    # geak_fused_moe's _build_routing_data already produces int32 contiguous
+    # tensors via torch.bincount (returns int32 when input is int32) and
+    # torch.cumsum + arange. Avoid redundant .to(int32).contiguous() — they
+    # are no-ops for the right dtype but still launch a kernel each.
+    expt_hist = expt_data.hist
+    if expt_hist.dtype != torch.int32 or not expt_hist.is_contiguous():
+        expt_hist = expt_hist.to(torch.int32).contiguous()
+    expt_offs = expt_data.token_offs_raw
+    if expt_offs.dtype != torch.int32 or not expt_offs.is_contiguous():
+        expt_offs = expt_offs.to(torch.int32).contiguous()
+    expt_block_pid_map = expt_data.block_pid_map
+    if expt_block_pid_map.dtype != torch.int32 or not expt_block_pid_map.is_contiguous():
+        expt_block_pid_map = expt_block_pid_map.to(torch.int32).contiguous()
     expt_offs_sum = (
         None
         if expt_data.token_offs_pad is None
         else expt_data.token_offs_pad[-1:].to(torch.int32).contiguous()
     )
 
-    # Optional tensors passed to the kernel; use empty 1-element placeholders
-    # when None so the C++ side doesn't need to handle null Tensors.
-    _empty_i32 = torch.empty((0,), dtype=torch.int32, device=x.device)
-    _empty_f32 = torch.empty((0,), dtype=torch.float32, device=x.device)
+    # Optional tensors passed to the kernel; use cached empty placeholders
+    # when None so the C++ side doesn't need to handle null Tensors and we
+    # avoid per-call zero-byte allocations.
+    _empty_i32, _empty_f32 = _empty_placeholders(x.device)
 
     block_m, block_n, block_k = config["block_m"], config["block_n"], config["block_k"]
     grid_m = routing_data.n_blocks(M, block_m)
