@@ -209,7 +209,10 @@ class QuarkW4A8Fp8MoE(QuarkMoEScheme):
         # row-major source into it via a permute target ``[E, K/2, N]``:
         # the resulting tensor has ``stride = (N*K/2, 1, K/2)`` which is
         # exactly what the kernel wants.
-        from aiter.ops.triton.moe.moe_op_gemm_a8w4 import swizzle_scales_gfx950
+        #from aiter.ops.triton.moe.moe_op_gemm_a8w4 import swizzle_scales_gfx950
+        from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
+            swizzle_scales as swizzle_scales_gfx950,
+        )
 
         def _to_k_fast(src: torch.Tensor) -> torch.Tensor:
             """``[E, N, K]`` row-major -> ``[E, K, N]`` with stride(-2)==1."""
